@@ -1,7 +1,6 @@
 import json, os
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import List
-
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.tools import tool
 from langchain.agents import create_tool_calling_agent, AgentExecutor
@@ -9,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 llm = ChatGoogleGenerativeAI(
     model="models/gemini-flash-latest",
     temperature=0,
@@ -68,15 +68,19 @@ Output should be clear and structured.
     response = llm.invoke(prompt)
     return response.content
 SYSTEM_PROMPT = """
-You are a data transformation agent.
+        You are a data transformation agent.
 
-Rules:
-- Understand user intent
-- Ask for source and sink files before analysis
-- Generate transformation as a draft
-- Keep everything in DRAFT until user says OK
-- Do not auto-submit without confirmation
-"""
+        You must:
+        - Understand the user's intent automatically
+        - Ask for source and sink JSON files if missing
+        - Analyze schemas only after both are provided
+        - Create a transformation draft
+        - Keep everything in DRAFT status
+        - Only submit when user explicitly says OK / Submit
+
+        You have access to tools for schema analysis.
+        """
+
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT),
@@ -98,52 +102,20 @@ agent_executor = AgentExecutor(
 
 @app.post("/chat")
 async def chat(message: str = Form(...)):
-    msg = message.lower().strip()
+    result = agent_executor.invoke({
+        "input": message,
+        "source_schema": session.get("source_schema"),
+        "sink_schema": session.get("sink_schema"),
+        "draft": session.get("draft"),
+        "status": session.get("status")
+    })
 
-    if any(word in msg for word in ["convert", "transform", "map"]):
-        session["intent"] = "SOURCE_TO_SINK"
-        return {
-            "reply": "Got it 👍 Please upload the source and sink JSON files.",
-            "status": session["status"]
-        }
-
-    if msg in ["ok", "okay", "proceed", "submit", "looks good"]:
-        if not session["draft"]:
-            return {"reply": "Nothing to submit yet."}
-
-        session["status"] = "SUBMITTED"
-        return {
-            "reply": "✅ Transformation submitted successfully.",
-            "final_output": session["draft"],
-            "status": session["status"]
-        }
-
-    if session["draft"]:
-        refine_prompt = f"""
-You are refining an existing transformation draft.
-
-CURRENT DRAFT:
-{session["draft"]}
-
-USER FEEDBACK:
-{message}
-
-Rules:
-- Update the draft based on feedback
-- Keep it concise
-- Maintain correct mappings
-"""
-        response = llm.invoke(refine_prompt)
-        session["draft"] = response.content
-
-        return {
-            "reply": "Draft updated based on your feedback.",
-            "draft": session["draft"],
-            "status": session["status"]
-        }
+    if "DRAFT:" in result["output"]:
+        session["draft"] = result["output"]
+        session["status"] = "DRAFT"
 
     return {
-        "reply": "Please describe what you want to do (e.g., convert source JSON to sink JSON).",
+        "reply": result["output"],
         "status": session["status"]
     }
 
