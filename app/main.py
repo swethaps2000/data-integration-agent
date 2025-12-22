@@ -11,12 +11,12 @@ from services.json_conversion_service import convert_json_with_sample
 load_dotenv()
 
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
     model="models/gemini-flash-latest",
     temperature=0,
-    google_api_key=GEMINI_API_KEY
+    google_api_key=GOOGLE_API_KEY
 )
 
 app = FastAPI(title="POC")
@@ -72,32 +72,54 @@ Tasks:
 
 
 @tool
-async def transform_json(source_json: dict, sink_json: dict) -> dict:
+async def transform_json(source_json: str, sink_json: str) -> dict:
     """
-    Convert source JSON to sink JSON using existing conversion service.
+    Execute the final JSON transformation.
+    Must be called ONLY after user approval.
     """
-    return await convert_json_with_sample(source_json, sink_json)
+    source = json.loads(source_json)
+    sink = json.loads(sink_json)
+    return await convert_json_with_sample(source, sink)
+
+def build_agent_context():
+    return f"""
+CURRENT STATUS: {session['status']}
+
+SOURCE JSON:
+{json.dumps(session['source_json'], indent=2) if session['source_json'] else 'NOT PROVIDED'}
+
+SINK JSON:
+{json.dumps(session['sink_json'], indent=2) if session['sink_json'] else 'NOT PROVIDED'}
+
+SOURCE SCHEMA:
+{json.dumps(session['source_schema'], indent=2) if session['source_schema'] else 'NOT PROVIDED'}
+
+SINK SCHEMA:
+{json.dumps(session['sink_schema'], indent=2) if session['sink_schema'] else 'NOT PROVIDED'}
+
+CURRENT DRAFT:
+{session['draft'] if session['draft'] else 'NO DRAFT'}
+"""
+
+
 SYSTEM_PROMPT = """
-You are a data transformation agent.
+You are an autonomous data transformation agent.
 
-Rules:
-1. If SOURCE or SINK schema is missing, ask the user to upload them.
-2. If both schemas are available and no draft exists:
-   - Create a detailed transformation draft.
-   - The draft MUST start with the word "DRAFT:".
-   - Include:
-     • Field mappings
-     • Missing fields
-     • Assumptions
-     • Transformation notes
-3. If a draft exists and the user suggests changes:
-   - Update the draft
-   - Keep status as DRAFT
-4. ONLY if the user says "OK", "Submit", or "Approve":
-   - Confirm submission readiness
-   - Do NOT ask for schemas again
-5. Never forget previously provided schemas or drafts.
+You must follow these rules strictly:
 
+1. If SOURCE JSON or SINK JSON is missing, ask the user to upload them.
+2. If both are available and no draft exists:
+   - Create a detailed DRAFT.
+   - Start the response with "DRAFT:".
+3. If a draft exists:
+   - Wait for user approval.
+   - Do NOT execute yet.
+4. When the user approves the draft:
+   - CALL the `transform_json` tool.
+   - Pass SOURCE JSON and SINK JSON exactly as provided.
+   - Return ONLY the final transformed JSON.
+5. Never ask for schemas or data again after execution.
+6. Do not explain after calling the tool.
 
         """
 
@@ -117,7 +139,7 @@ agent = create_tool_calling_agent(
 agent_executor = AgentExecutor(
     agent=agent,
     tools=[analyze_schemas, transform_json],
-    verbose=True
+    verbose=False 
 )
 
 
@@ -125,32 +147,30 @@ agent_executor = AgentExecutor(
 
 @app.post("/chat")
 async def chat(message: str = Form(...)):
-    agent_context = f"""
-        CURRENT STATUS: {session['status']}
+    context = build_agent_context()
 
-        SOURCE SCHEMA:
-        {json.dumps(session['source_schema'], indent=2) if session['source_schema'] else 'NOT PROVIDED'}
+    result = await agent_executor.ainvoke({
+        "input": context + "\n\nUSER MESSAGE:\n" + message
+    })
 
-        SINK SCHEMA:
-        {json.dumps(session['sink_schema'], indent=2) if session['sink_schema'] else 'NOT PROVIDED'}
+    output = result["output"]
 
-        CURRENT DRAFT:
-        {session['draft'] if session['draft'] else 'NO DRAFT YET'}
-        """
-
-    result = agent_executor.invoke({
-            "input": agent_context + "\n\nUSER MESSAGE:\n" + message
-        })
-
-
-    if "DRAFT:" in result["output"]:
-        session["draft"] = result["output"]
+    if isinstance(output, dict):
+        session["status"] = "SUBMITTED"
+        return {
+            "reply": output,
+            "status": session["status"]
+        }
+    if isinstance(output, str) and output.startswith("DRAFT:"):
+        session["draft"] = output
         session["status"] = "DRAFT"
 
     return {
-        "reply": result["output"],
+        "reply": output,
         "status": session["status"]
     }
+
+
 
 @app.post("/upload")
 async def upload_files(
