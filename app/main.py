@@ -1,10 +1,14 @@
-import json, os
+import json
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import List
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.tools import tool
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate
+from services.json_conversion_service import convert_json_with_sample
+load_dotenv()
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -19,11 +23,14 @@ app = FastAPI(title="POC")
 
 session = {
     "intent": None,
+    "source_json": None,
+    "sink_json": None,
     "source_schema": None,
     "sink_schema": None,
     "draft": None,
     "status": "DRAFT"
 }
+
 
 def extract_json_schema(data):
     if isinstance(data, list):
@@ -40,45 +47,58 @@ def extract_json_schema(data):
     ]
 
 @tool
-def analyze_schemas(source_schema: List[dict], sink_schema: List[dict]) -> str:
+def analyze_schemas(source_schema: str, sink_schema: str) -> str:
     """
-    Analyze source and sink JSON schemas and suggest:
-    - Field mappings
-    - Missing or extra fields
-    - Required transformations
-    - Assumptions and explanations
+    Analyze source and sink JSON schemas and suggest mappings.
     """
     prompt = f"""
 You are a senior data integration expert.
 
 SOURCE SCHEMA:
-{json.dumps(source_schema, indent=2)}
+{source_schema}
 
 SINK SCHEMA:
-{json.dumps(sink_schema, indent=2)}
+{sink_schema}
 
 Tasks:
 - Suggest field mappings
 - Identify missing or extra fields
 - Suggest transformations
 - Clearly explain assumptions
-
-Output should be clear and structured.
 """
     response = llm.invoke(prompt)
     return response.content
+
+
+
+@tool
+async def transform_json(source_json: dict, sink_json: dict) -> dict:
+    """
+    Convert source JSON to sink JSON using existing conversion service.
+    """
+    return await convert_json_with_sample(source_json, sink_json)
 SYSTEM_PROMPT = """
-        You are a data transformation agent.
+You are a data transformation agent.
 
-        You must:
-        - Understand the user's intent automatically
-        - Ask for source and sink JSON files if missing
-        - Analyze schemas only after both are provided
-        - Create a transformation draft
-        - Keep everything in DRAFT status
-        - Only submit when user explicitly says OK / Submit
+Rules:
+1. If SOURCE or SINK schema is missing, ask the user to upload them.
+2. If both schemas are available and no draft exists:
+   - Create a detailed transformation draft.
+   - The draft MUST start with the word "DRAFT:".
+   - Include:
+     • Field mappings
+     • Missing fields
+     • Assumptions
+     • Transformation notes
+3. If a draft exists and the user suggests changes:
+   - Update the draft
+   - Keep status as DRAFT
+4. ONLY if the user says "OK", "Submit", or "Approve":
+   - Confirm submission readiness
+   - Do NOT ask for schemas again
+5. Never forget previously provided schemas or drafts.
 
-        You have access to tools for schema analysis.
+
         """
 
 
@@ -90,25 +110,38 @@ prompt = ChatPromptTemplate.from_messages([
 
 agent = create_tool_calling_agent(
     llm=llm,
-    tools=[analyze_schemas],
+    tools=[analyze_schemas, transform_json],
     prompt=prompt
 )
 
 agent_executor = AgentExecutor(
     agent=agent,
-    tools=[analyze_schemas],
+    tools=[analyze_schemas, transform_json],
     verbose=True
 )
 
+
+
+
 @app.post("/chat")
 async def chat(message: str = Form(...)):
+    agent_context = f"""
+        CURRENT STATUS: {session['status']}
+
+        SOURCE SCHEMA:
+        {json.dumps(session['source_schema'], indent=2) if session['source_schema'] else 'NOT PROVIDED'}
+
+        SINK SCHEMA:
+        {json.dumps(session['sink_schema'], indent=2) if session['sink_schema'] else 'NOT PROVIDED'}
+
+        CURRENT DRAFT:
+        {session['draft'] if session['draft'] else 'NO DRAFT YET'}
+        """
+
     result = agent_executor.invoke({
-        "input": message,
-        "source_schema": session.get("source_schema"),
-        "sink_schema": session.get("sink_schema"),
-        "draft": session.get("draft"),
-        "status": session.get("status")
-    })
+            "input": agent_context + "\n\nUSER MESSAGE:\n" + message
+        })
+
 
     if "DRAFT:" in result["output"]:
         session["draft"] = result["output"]
@@ -135,6 +168,9 @@ async def upload_files(
 
     session["source_schema"] = source_schema
     session["sink_schema"] = sink_schema
+    session["source_json"] = source_data
+    session["sink_json"] = sink_data
+
 
 
     agent_input = f"""
@@ -147,7 +183,12 @@ SINK SCHEMA:
 {json.dumps(sink_schema)}
 """
 
-    result = agent_executor.invoke({"input": agent_input})
+    result = agent_executor.invoke({
+    "input": agent_input,
+    "source_schema": session["source_schema"],
+    "sink_schema": session["sink_schema"]
+})
+
 
     session["draft"] = result["output"]
     session["status"] = "DRAFT"
